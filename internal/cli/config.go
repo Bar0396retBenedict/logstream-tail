@@ -1,100 +1,94 @@
-// Package cli provides configuration loading and validation for the
-// logstream-tail command-line interface.
 package cli
 
 import (
 	"errors"
+	"flag"
 	"fmt"
-	"strings"
 	"time"
 
-	"github.com/spf13/pflag"
+	"github.com/user/logstream-tail/internal/formatter"
+	"github.com/user/logstream-tail/internal/source"
 )
 
-// SourceType identifies which cloud logging backend to stream from.
-type SourceType string
-
-const (
-	SourceCloudWatch SourceType = "cloudwatch"
-	SourceGCP        SourceType = "gcp"
-)
-
-// Config holds all runtime options parsed from flags / environment.
+// Config holds all runtime configuration parsed from CLI flags.
 type Config struct {
-	Sources       []SourceType
-	LogGroups     []string   // CloudWatch log group names
-	GCPProject    string     // GCP project ID
-	GCPFilter     string     // GCP advanced log filter
-	MinSeverity   string     // minimum severity to display
-	OutputStyle   string     // plain | json | color
-	PollInterval  time.Duration
-	HideSource    bool
+	// CloudWatch options
+	LogGroup  string
+	LogStream string
+	Region    string
+
+	// GCP options
+	GCPProject string
+	GCPFilter  string
+
+	// Common options
+	PollInterval time.Duration
+	MaxEventsPS  int
+	Style        string
+	HideSource   bool
+	NoColor      bool
+
+	// Retry options
+	RetryMaxAttempts int
+	RetryBaseDelay   time.Duration
+	RetryMaxDelay    time.Duration
 }
 
-// ParseFlags registers flags on fs and returns a Config populated from them.
-// Call fs.Parse(os.Args[1:]) before using the returned Config.
-func ParseFlags(fs *pflag.FlagSet) *Config {
+// ParseFlags parses os.Args using the supplied FlagSet and returns a Config.
+func ParseFlags(fs *flag.FlagSet, args []string) (*Config, error) {
 	cfg := &Config{}
 
-	var sources string
-	fs.StringVarP(&sources, "source", "s", "cloudwatch",
-		"comma-separated list of sources to stream (cloudwatch, gcp)")
-	fs.StringArrayVar(&cfg.LogGroups, "log-group", nil,
-		"CloudWatch log group name (repeatable)")
-	fs.StringVar(&cfg.GCPProject, "gcp-project", "",
-		"GCP project ID")
-	fs.StringVar(&cfg.GCPFilter, "gcp-filter", "",
-		"GCP advanced log filter expression")
-	fs.StringVar(&cfg.MinSeverity, "min-severity", "INFO",
-		"minimum severity level to display (DEBUG, INFO, WARN, ERROR)")
-	fs.StringVar(&cfg.OutputStyle, "style", "color",
-		"output style: plain, json, or color")
-	fs.DurationVar(&cfg.PollInterval, "poll-interval", 5*time.Second,
-		"how often to poll each source for new log entries")
-	fs.BoolVar(&cfg.HideSource, "hide-source", false,
-		"omit the source label from output lines")
+	fs.StringVar(&cfg.LogGroup, "log-group", "", "CloudWatch log group name")
+	fs.StringVar(&cfg.LogStream, "log-stream", "", "CloudWatch log stream prefix")
+	fs.StringVar(&cfg.Region, "region", "us-east-1", "AWS region")
 
-	// Resolve sources after Parse via a post-parse hook stored in cfg.
-	fs.ParseErrorsWhitelist.UnknownFlags = true
-	_ = fs.Parse(nil) // no-op; caller calls Parse
+	fs.StringVar(&cfg.GCPProject, "gcp-project", "", "GCP project ID")
+	fs.StringVar(&cfg.GCPFilter, "gcp-filter", "", "GCP logging filter expression")
 
-	// Lazy evaluation: store raw string, resolve in Validate.
-	cfg.Sources = nil
-	_ = sources // resolved in Validate via fs lookup
+	fs.DurationVar(&cfg.PollInterval, "poll-interval", source.DefaultConfig().PollInterval, "polling interval")
+	fs.IntVar(&cfg.MaxEventsPS, "max-events-ps", 0, "max log events per second (0 = unlimited)")
+	fs.StringVar(&cfg.Style, "style", "plain", "output style: plain|json|color")
+	fs.BoolVar(&cfg.HideSource, "hide-source", false, "omit source label from output")
+	fs.BoolVar(&cfg.NoColor, "no-color", false, "disable ANSI colour even in color style")
 
-	return cfg
+	fs.IntVar(&cfg.RetryMaxAttempts, "retry-max-attempts", 0, "max reconnect attempts (0 = unlimited)")
+	fs.DurationVar(&cfg.RetryBaseDelay, "retry-base-delay", 500*time.Millisecond, "initial retry back-off delay")
+	fs.DurationVar(&cfg.RetryMaxDelay, "retry-max-delay", 30*time.Second, "maximum retry back-off delay")
+
+	if err := fs.Parse(args); err != nil {
+		return nil, err
+	}
+	return cfg, nil
 }
 
-// Validate checks that the Config is self-consistent and resolves any
-// fields that depend on other flags.
-func (c *Config) Validate(fs *pflag.FlagSet) error {
-	raw, err := fs.GetString("source")
-	if err != nil {
-		return fmt.Errorf("reading --source flag: %w", err)
+// Validate returns an error if the config is not self-consistent.
+func (c *Config) Validate() error {
+	hasCW := c.LogGroup != ""
+	hasGCP := c.GCPProject != ""
+
+	if !hasCW && !hasGCP {
+		return errors.New("at least one source must be configured (--log-group or --gcp-project)")
 	}
-	for _, part := range strings.Split(raw, ",") {
-		st := SourceType(strings.TrimSpace(strings.ToLower(part)))
-		switch st {
-		case SourceCloudWatch, SourceGCP:
-			c.Sources = append(c.Sources, st)
-		default:
-			return fmt.Errorf("unknown source %q; valid values: cloudwatch, gcp", part)
-		}
+	if hasCW && c.Region == "" {
+		return errors.New("--region is required when --log-group is set")
 	}
-	if len(c.Sources) == 0 {
-		return errors.New("at least one --source is required")
+	if _, err := formatter.StyleFromString(c.Style); err != nil {
+		return fmt.Errorf("invalid --style: %w", err)
 	}
-	for _, st := range c.Sources {
-		switch st {
-		case SourceCloudWatch:
-			if len(c.LogGroups) == 0 {
-				return errors.New("--log-group is required when using the cloudwatch source")
-			}
-		case SourceGCP:
-			if c.GCPProject == "" {
-				return errors.New("--gcp-project is required when using the gcp source")
-			}
-		}
+	if c.RetryBaseDelay <= 0 {
+		return errors.New("--retry-base-delay must be positive")
+	}
+	if c.RetryMaxDelay < c.RetryBaseDelay {
+		return errors.New("--retry-max-delay must be >= --retry-base-delay")
 	}
 	return nil
+}
+
+// RetryConfig converts the CLI retry flags into a source.RetryConfig.
+func (c *Config) RetryConfig() source.RetryConfig {
+	return source.RetryConfig{
+		MaxAttempts: c.RetryMaxAttempts,
+		BaseDelay:   c.RetryBaseDelay,
+		MaxDelay:    c.RetryMaxDelay,
+	}
 }
