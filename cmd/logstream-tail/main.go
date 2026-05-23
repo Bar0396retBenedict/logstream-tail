@@ -1,4 +1,3 @@
-// Package main is the entry point for the logstream-tail CLI.
 package main
 
 import (
@@ -15,16 +14,16 @@ import (
 )
 
 func main() {
-	if err := run(); err != nil {
+	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-func run() error {
-	cfg, err := cli.ParseFlags(os.Args[1:])
+func run(args []string) error {
+	cfg, err := cli.ParseFlags(args)
 	if err != nil {
-		return fmt.Errorf("parsing flags: %w", err)
+		return err
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -32,41 +31,53 @@ func run() error {
 
 	sources, err := buildSources(cfg)
 	if err != nil {
-		return fmt.Errorf("building sources: %w", err)
+		return err
+	}
+	if len(sources) == 0 {
+		return fmt.Errorf("no sources configured; pass --cloudwatch-log-group or --gcp-project")
 	}
 
-	fmt, err := formatter.New(cfg.Style, cfg.ShowSource)
-	if err != nil {
-		return fmt.Errorf("creating formatter: %w", err)
-	}
+	fanIn, merged := source.NewFanIn(sources...)
+	go fanIn.Run(ctx)
 
-	ch := source.NewFanIn(ctx, sources...)
+	// Buffer the merged stream to smooth micro-bursts.
+	bufCfg := source.DefaultBufferConfig()
+	buf, buffered := source.NewBuffer(merged, bufCfg)
+	go buf.Run(ctx)
+
+	fmt := formatter.New(formatter.StyleFromString(cfg.Style))
 	w := output.New(os.Stdout, fmt)
-	return w.Run(ctx, ch)
+	return w.Run(ctx, buffered)
 }
 
-func buildSources(cfg *cli.Config) ([]<-chan logevent.Event, error) {
-	var srcs []<-chan logevent.Event
+func buildSources(cfg *cli.Config) ([]source.Source, error) {
+	var sources []source.Source
 
-	for _, cw := range cfg.CloudWatch {
-		s, err := source.NewCloudWatchSource(cfg.Context, cw)
+	if cfg.CloudWatchLogGroup != "" {
+		s, err := source.NewCloudWatchSource(source.CloudWatchConfig{
+			LogGroup:     cfg.CloudWatchLogGroup,
+			Region:       cfg.CloudWatchRegion,
+			PollInterval: cfg.PollInterval,
+			Filter:       source.DefaultConfig(),
+		})
 		if err != nil {
-			return nil, fmt.Errorf("cloudwatch source %q: %w", cw.LogGroup, err)
+			return nil, fmt.Errorf("cloudwatch: %w", err)
 		}
-		srcs = append(srcs, s)
+		sources = append(sources, s)
 	}
 
-	for _, gcp := range cfg.GCP {
-		s, err := source.NewGCPSource(cfg.Context, gcp)
+	if cfg.GCPProject != "" {
+		s, err := source.NewGCPSource(source.GCPConfig{
+			Project:      cfg.GCPProject,
+			LogID:        cfg.GCPLogID,
+			PollInterval: cfg.PollInterval,
+			Filter:       source.DefaultConfig(),
+		})
 		if err != nil {
-			return nil, fmt.Errorf("gcp source %q: %w", gcp.LogName, err)
+			return nil, fmt.Errorf("gcp: %w", err)
 		}
-		srcs = append(srcs, s)
+		sources = append(sources, s)
 	}
 
-	if len(srcs) == 0 {
-		return nil, fmt.Errorf("no log sources configured; specify --cw-log-group or --gcp-log-name")
-	}
-
-	return srcs, nil
+	return sources, nil
 }
