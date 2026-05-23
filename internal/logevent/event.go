@@ -63,3 +63,9 @@ func (e Event) String() string {
 		e.Message,
 	)
 }
+
+// IsAtLeast reports whether the event's severity is greater than or equal to
+// the given minimum severity. This is useful for filtering events by level.
+func (e Event) IsAtLeast(min Severity) bool {
+	return e.Severity >= min
+}
