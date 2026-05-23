@@ -2,120 +2,87 @@ package source
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"sync"
 	"time"
 
-	"github.com/user/logstream-tail/internal/logevent"
+	"github.com/your-org/logstream-tail/internal/logevent"
 )
 
-// Deduplicator filters out duplicate log events within a configurable time
-// window. Events are considered duplicates if they share the same source,
-// message, and severity within the deduplication window.
-//
-// This is useful when multiple cloud sources may emit overlapping log entries
-// (e.g., during a polling overlap or a source restart).
-type Deduplicator struct {
-	in     <-chan logevent.Event
-	out    chan logevent.Event
-	window time.Duration
-
-	mu   sync.Mutex
-	seen map[string]time.Time
+type dedupEntry struct {
+	key     string
+	seenAt  time.Time
 }
 
-// NewDeduplicator wraps an input channel and returns a Deduplicator that
-// suppresses duplicate events within the given time window.
-// A window of zero disables deduplication (all events pass through).
-func NewDeduplicator(in <-chan logevent.Event, window time.Duration) *Deduplicator {
-	return &Deduplicator{
-		in:     in,
-		out:    make(chan logevent.Event, cap(in)+1),
-		window: window,
-		seen:   make(map[string]time.Time),
+type deduplicator struct {
+	cfg     DedupeConfig
+	entries []dedupEntry
+	mu      sync.Mutex
+}
+
+func fingerprint(ev logevent.Event) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%d|%s", ev.Source, ev.Severity, ev.Message)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+func (d *deduplicator) isDuplicate(key string, now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Evict expired entries.
+	active := d.entries[:0]
+	for _, e := range d.entries {
+		if now.Sub(e.seenAt) < d.cfg.Window {
+			active = append(active, e)
+		}
 	}
+	d.entries = active
+
+	for _, e := range d.entries {
+		if e.key == key {
+			return true
+		}
+	}
+
+	// Evict oldest when at capacity.
+	if len(d.entries) >= d.cfg.MaxTracked {
+		d.entries = d.entries[1:]
+	}
+	d.entries = append(d.entries, dedupEntry{key: key, seenAt: now})
+	return false
 }
 
-// Out returns the channel of deduplicated events.
-func (d *Deduplicator) Out() <-chan logevent.Event {
-	return d.out
-}
+// NewDeduplicator returns a channel that forwards events from upstream while
+// suppressing duplicates within the configured window.
+func NewDeduplicator(ctx context.Context, upstream <-chan logevent.Event, cfg DedupeConfig) <-chan logevent.Event {
+	out := make(chan logevent.Event, cap(upstream))
+	d := &deduplicator{
+		cfg:     cfg,
+		entries: make([]dedupEntry, 0, cfg.MaxTracked),
+	}
 
-// Run reads from the input channel, suppresses duplicates, and forwards unique
-// events to the output channel. It returns when ctx is cancelled or the input
-// channel is closed.
-func (d *Deduplicator) Run(ctx context.Context) error {
-	defer close(d.out)
-
-	// Periodically evict expired entries to prevent unbounded memory growth.
-	ticker := time.NewTicker(d.evictInterval())
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-
-		case ev, ok := <-d.in:
-			if !ok {
-				return nil
-			}
-			if d.window == 0 || d.admit(ev) {
-				select {
-				case d.out <- ev:
-				case <-ctx.Done():
-					return ctx.Err()
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-upstream:
+				if !ok {
+					return
+				}
+				if !d.isDuplicate(fingerprint(ev), time.Now()) {
+					select {
+					case out <- ev:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
-
-		case now := <-ticker.C:
-			d.evict(now)
 		}
-	}
-}
+	}()
 
-// admit returns true if the event has not been seen within the dedup window,
-// and records it as seen.
-func (d *Deduplicator) admit(ev logevent.Event) bool {
-	key := dedupKey(ev)
-	now := time.Now()
-
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	if last, exists := d.seen[key]; exists && now.Sub(last) < d.window {
-		return false
-	}
-	d.seen[key] = now
-	return true
-}
-
-// evict removes entries older than the dedup window.
-func (d *Deduplicator) evict(now time.Time) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	for key, ts := range d.seen {
-		if now.Sub(ts) >= d.window {
-			delete(d.seen, key)
-		}
-	}
-}
-
-// evictInterval returns how often to run the eviction sweep.
-// It is capped between 1 second and 1 minute.
-func (d *Deduplicator) evictInterval() time.Duration {
-	interval := d.window / 2
-	if interval < time.Second {
-		interval = time.Second
-	}
-	if interval > time.Minute {
-		interval = time.Minute
-	}
-	return interval
-}
-
-// dedupKey builds a string key that uniquely identifies a log event for the
-// purpose of deduplication. It combines source, severity, and message.
-func dedupKey(ev logevent.Event) string {
-	return ev.Source + "\x00" + ev.Severity.String() + "\x00" + ev.Message
+	return out
 }
